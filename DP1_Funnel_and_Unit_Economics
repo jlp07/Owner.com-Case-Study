@@ -18,12 +18,11 @@ with lead_channel as (
 --Outbound: month(first_sales_activity_date)
 leads_created as (
   select
-    date_trunc(
-      'month',
+    date_trunc('month',
       case
         when channel = 'INBOUND' then form_submission_date
         else first_sales_activity_date
-      end)::date as month_start,
+        end)::date as month_start,
     channel,
     count(*) as leads_created
   from lead_channel
@@ -144,7 +143,7 @@ with base as (
     closed_lost
   from DEMO_DB.GTM_MART.VW_GTM_DP1_BASE_COUNTS_MONTHLY
   where month_start >= '2024-01-01'::date
-    and month_start <=  '2024-06-01'::date,
+    and month_start <=  '2024-06-01'::date),
 
 lead_per_opp as (
   select
