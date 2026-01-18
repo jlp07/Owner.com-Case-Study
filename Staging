@@ -1,0 +1,174 @@
+--GTM_STAGE — Materialized staging tables (normalized)
+       --1) STG_LEADS
+       --2) STG_OPPORTUNITIES
+       --3) STG_EXPENSES_ADVERTISING
+       --4) STG_EXPENSES_SALARY_AND_COMMISSIONS
+
+create schema if not exists DEMO_DB.GTM_STAGE;
+
+--1) STG_LEADS
+create or replace table DEMO_DB.GTM_STAGE.STG_LEADS as
+select
+  lead_id,
+--Normalize submission date
+  case
+    when form_submission_date is null then null
+    when year(form_submission_date) < 1900
+      then date_from_parts(2000 + year(form_submission_date), month(form_submission_date), day(form_submission_date))
+    else form_submission_date
+  end as form_submission_date,
+
+  --Channel logic
+  case when form_submission_date is null then 'OUTBOUND' else 'INBOUND' end as channel,
+
+  sales_call_count,
+  sales_text_count,
+  sales_email_count,
+
+  --Normalize timestamps
+  cast(first_sales_call_date as date)       as first_sales_call_date,
+  cast(first_text_sent_date as date)        as first_text_sent_date,
+  cast(first_meeting_booked_date as date)   as first_meeting_booked_date,
+  cast(last_sales_call_date as date)        as last_sales_call_date,
+  cast(last_sales_activity_date as date)    as last_sales_activity_date,
+  cast(last_sales_email_date as date)       as last_sales_email_date,
+
+  --Normalize predicted sales
+  try_to_number(replace(predicted_sales_with_owner, ',', '.'))::number(18,2) as predicted_sales_with_owner,
+
+  --List cleanup
+  case
+    when marketplaces_used is null then null
+    when trim(marketplaces_used) in ('[]','[""]','[ " " ]','[" "]','[""] ') then null
+    when regexp_replace(trim(marketplaces_used), '\s', '') in ('[""]','[]') then null
+    else nullif(trim(replace(replace(replace(marketplaces_used, '[', ''), ']', ''), '''', '')), '')
+  end as marketplaces_used,
+
+  case
+    when online_ordering_used is null then null
+    when trim(online_ordering_used) in ('[]','[""]','[ " " ]','[" "]','[""] ') then null
+    when regexp_replace(trim(online_ordering_used), '\s', '') in ('[""]','[]') then null
+    else nullif(trim(replace(replace(replace(online_ordering_used, '[', ''), ']', ''), '''', '')), '')
+  end as online_ordering_used,
+
+  case
+    when cuisine_types is null then null
+    when trim(cuisine_types) in ('[]','[""]','[ " " ]','[" "]','[""] ') then null
+    when regexp_replace(trim(cuisine_types), '\s', '') in ('[""]','[]') then null
+    else nullif(trim(replace(replace(replace(cuisine_types, '[', ''), ']', ''), '''', '')), '')
+  end as cuisine_types,
+
+  location_count,
+  connected_with_decision_maker,
+  status,
+  converted_opportunity_id
+from DEMO_DB.GTM_CASE.LEADS;
+
+alter table DEMO_DB.GTM_STAGE.STG_LEADS
+  add column FIRST_SALES_ACTIVITY_DATE date;
+
+update DEMO_DB.GTM_STAGE.STG_LEADS
+set FIRST_SALES_ACTIVITY_DATE =
+  nullif(
+    least(
+      coalesce(to_date(FIRST_SALES_CALL_DATE),       '9999-12-31'::date),
+      coalesce(to_date(FIRST_TEXT_SENT_DATE),        '9999-12-31'::date),
+      coalesce(to_date(FIRST_MEETING_BOOKED_DATE),   '9999-12-31'::date)
+    ),
+    '9999-12-31'::date
+  );
+
+
+--QA leads
+select* from stg_leads;
+
+
+--2) STG_OPPORTUNITIES
+create or replace table DEMO_DB.GTM_STAGE.STG_OPPORTUNITIES as
+select
+  opportunity_id,
+  stage_name,
+
+  lost_reason_c as opportunity_lost_reason,
+  closed_lost_notes_c,
+  business_issue_c,
+  how_did_you_hear_about_us_c,
+
+  --Normalize timestamps
+  cast(created_date as date)               as created_date,
+  cast(created_date as date)               as demo_scheduled_date,  -- per your rule
+  cast(demo_time as date)                  as demo_time,
+
+  --Normalize demo_set_date
+  case
+    when demo_set_date is null then null
+    when year(demo_set_date) < 1900
+      then date_from_parts(
+             2000 + year(demo_set_date),
+             month(demo_set_date),
+             day(demo_set_date)
+           )
+    else demo_set_date
+  end as demo_set_date,
+
+  demo_held,
+
+  --Normalize close date
+  case
+    when close_date is null 
+    then null
+    when year(close_date) < 1900
+      then date_from_parts(
+             2000 + year(close_date),
+             month(close_date),
+             day(close_date)
+           )
+    else close_date
+  end as close_date,
+
+  cast(last_sales_call_date_time as date)  as last_sales_call_date,
+
+  account_id,
+
+  --Stage flags
+  case when lower(stage_name) like '%closed won%' then 1 else 0 end as is_closed_won,
+  case when lower(stage_name) like '%closed lost%' then 1 else 0 end as is_closed_lost
+
+from DEMO_DB.GTM_CASE.OPPORTUNITIES;
+
+--QA Opportunities
+select * from stg_opportunities;
+
+
+--3) STG_EXPENSES_ADVERTISING
+create or replace table DEMO_DB.GTM_STAGE.STG_EXPENSES_ADVERTISING as
+select
+--Month Normalization
+  to_date(month, 'MON-YY') as month,
+--Currency Normalization
+  try_to_number(
+    replace(regexp_replace(advertising, '[^0-9,]', ''), ',', '.'), 18, 2)::number(18,2) as advertising_spend
+from DEMO_DB.GTM_CASE.EXPENSES_ADVERTISING;
+
+
+--QA Advertising
+select * from stg_expenses_advertising;
+
+
+--4) STG_EXPENSES_SALARY_AND_COMMISSIONS
+create or replace table DEMO_DB.GTM_STAGE.STG_EXPENSES_SALARY_AND_COMMISSIONS as
+select
+  --Month Normalization
+  to_date(month, 'MON-YY') as month,
+--Currency Normalization
+  try_to_number(
+    replace(
+      regexp_replace(inbound_sales_team, '[^0-9,]', ''), ',', '.'), 18, 2)::number(18,2) as inbound_sales_team_spend,
+  try_to_number(
+    replace(
+      regexp_replace(outbound_sales_team, '[^0-9,]', ''), ',', '.'), 18,2)::number(18,2) as outbound_sales_team_spend
+
+from DEMO_DB.GTM_CASE.EXPENSES_SALARY_AND_COMMISSIONS;
+
+--QA salaries & commissions
+select* from stg_expenses_salary_and_commissions;
