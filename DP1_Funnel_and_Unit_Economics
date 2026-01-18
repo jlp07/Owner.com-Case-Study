@@ -1,0 +1,340 @@
+create or replace schema gtm_mart;
+
+create or replace view DEMO_DB.GTM_MART.VW_GTM_DP1_BASE_COUNTS_MONTHLY as
+with lead_channel as (
+  select
+    l.lead_id,
+    l.converted_opportunity_id,
+    case
+      when l.form_submission_date is not null then 'INBOUND'
+      else 'OUTBOUND'
+    end as channel,
+    l.form_submission_date,
+    l.first_sales_activity_date
+  from DEMO_DB.GTM_STAGE.STG_LEADS l),
+
+--Leads Created
+--Inbound: month(form_submission_date)
+--Outbound: month(first_sales_activity_date)
+leads_created as (
+  select
+    date_trunc(
+      'month',
+      case
+        when channel = 'INBOUND' then form_submission_date
+        else first_sales_activity_date
+      end)::date as month_start,
+    channel,
+    count(*) as leads_created
+  from lead_channel
+  where (channel = 'INBOUND' and form_submission_date is not null)
+     or (channel = 'OUTBOUND' and first_sales_activity_date is not null)
+  group by 1,2),
+
+--Opportunity attribution
+opp_attribution as (
+  select
+    o.opportunity_id,
+    o.demo_scheduled_date::date as demo_scheduled_date,
+    o.demo_held,
+    o.close_date::date as close_date,
+    o.is_closed_won,
+    o.is_closed_lost,
+    case
+      when l.form_submission_date is not null then 'INBOUND'
+      else 'OUTBOUND'
+      end as channel
+  from DEMO_DB.GTM_STAGE.STG_OPPORTUNITIES o
+  left join DEMO_DB.GTM_STAGE.STG_LEADS l
+    on l.converted_opportunity_id = o.opportunity_id),
+
+--Demos Scheduled
+--month(demo_scheduled_date)
+demos_scheduled as (
+  select
+    date_trunc('month', demo_scheduled_date)::date as month_start,
+    channel,
+    count(distinct opportunity_id) as demos_scheduled
+  from opp_attribution
+  where demo_scheduled_date is not null
+  group by 1,2),
+
+--Demos Held 
+--demo_held = TRUE and month anchored to demo_scheduled_date
+demos_held as (
+  select
+    date_trunc('month', demo_scheduled_date)::date as month_start,
+    channel,
+    count(distinct opportunity_id) as demos_held
+  from opp_attribution
+  where demo_held = true
+  and demo_scheduled_date is not null
+  group by 1,2),
+
+--Closed Won / Lost
+--month(close_date)
+closed_won as (
+  select
+    date_trunc('month', close_date)::date as month_start,
+    channel,
+    count(distinct opportunity_id) as closed_won
+  from opp_attribution
+  where is_closed_won = 1
+  and close_date is not null
+  group by 1,2),
+
+closed_lost as (
+  select
+    date_trunc('month', close_date)::date as month_start,
+    channel,
+    count(distinct opportunity_id) as closed_lost
+  from opp_attribution
+  where is_closed_lost = 1
+    and close_date is not null
+  group by 1,2),
+
+--Month x Channel
+spine as (
+  select month_start, channel from leads_created
+  union
+  select month_start, channel from demos_scheduled
+  union
+  select month_start, channel from demos_held
+  union
+  select month_start, channel from closed_won
+  union
+  select month_start, channel from closed_lost)
+
+select
+  s.month_start,
+  s.channel,
+  coalesce(lc.leads_created, 0) as leads_created,
+  coalesce(ds.demos_scheduled, 0) as demos_scheduled,
+  coalesce(dh.demos_held, 0) as demos_held,
+  coalesce(cw.closed_won, 0) as closed_won,
+  coalesce(cl.closed_lost, 0) as closed_lost
+from spine s
+left join leads_created lc
+  on s.month_start = lc.month_start and s.channel = lc.channel
+left join demos_scheduled ds
+  on s.month_start = ds.month_start and s.channel = ds.channel
+left join demos_held dh
+  on s.month_start = dh.month_start and s.channel = dh.channel
+left join closed_won cw
+  on s.month_start = cw.month_start and s.channel = cw.channel
+left join closed_lost cl
+  on s.month_start = cl.month_start and s.channel = cl.channel
+where s.month_start >= '2024-01-01'::date
+  and s.month_start <= '2024-06-01'::date
+order by 1,2;
+
+--QA
+select * from DEMO_DB.GTM_MART.VW_GTM_DP1_BASE_COUNTS_MONTHLY;
+
+
+create or replace view DEMO_DB.GTM_MART.VW_GTM_FUNNEL_UNIT_ECONOMICS_MONTHLY as
+with base as (
+  select
+    month_start,
+    channel,
+    leads_created,
+    demos_scheduled,
+    demos_held,
+    closed_won,
+    closed_lost
+  from DEMO_DB.GTM_MART.VW_GTM_DP1_BASE_COUNTS_MONTHLY
+  where month_start >= '2024-01-01'::date
+    and month_start <=  '2024-06-01'::date,
+
+lead_per_opp as (
+  select
+    converted_opportunity_id as opportunity_id,
+    case
+      when max(case when form_submission_date is not null then 1 else 0 end) = 1 then 'INBOUND'
+      else 'OUTBOUND'
+    end as channel,
+    min(form_submission_date)::date as form_submission_date,
+    min(first_sales_activity_date)::date as first_sales_activity_date,
+    max((predicted_sales_with_owner)) as predicted_sales_with_owner
+  from DEMO_DB.GTM_STAGE.STG_LEADS
+  where converted_opportunity_id is not null
+  group by 1),
+
+opp_enriched as (
+  select
+    o.opportunity_id,
+    o.demo_scheduled_date::date as demo_scheduled_date,
+    o.demo_held,
+    o.close_date::date as close_date,
+    o.is_closed_won,
+    o.is_closed_lost,
+    coalesce(lpo.channel, 'OUTBOUND') as channel,
+    lpo.form_submission_date,
+    lpo.first_sales_activity_date,
+    coalesce(lpo.predicted_sales_with_owner, 0) as predicted_sales_with_owner,
+    (500 + coalesce(lpo.predicted_sales_with_owner, 0)) as expected_monthly_revenue
+  from DEMO_DB.GTM_STAGE.STG_OPPORTUNITIES o
+  left join lead_per_opp lpo
+    on lpo.opportunity_id = o.opportunity_id),
+
+--Velocity Metrics
+velocity_form_to_first_activity as (
+  select
+    date_trunc('month', first_sales_activity_date)::date as month_start,
+    channel,
+    round(avg(datediff('day', form_submission_date, first_sales_activity_date)), 0)
+      as avg_days_form_submission_to_first_activity
+  from opp_enriched
+  where channel = 'INBOUND'
+    and form_submission_date is not null
+    and first_sales_activity_date is not null
+  group by 1,2),
+
+velocity_first_activity_to_demo as (
+  select
+    date_trunc('month', demo_scheduled_date)::date as month_start,
+    channel,
+    round(avg(datediff('day', first_sales_activity_date, demo_scheduled_date)), 0)
+      as avg_days_first_activity_to_demo_scheduled
+  from opp_enriched
+  where first_sales_activity_date is not null
+    and demo_scheduled_date is not null
+  group by 1,2),
+
+--held date = demo_scheduled_date when demo_held = TRUE 
+velocity_held_to_close as (
+  select
+    date_trunc('month', close_date)::date as month_start,
+    channel,
+    round(avg(datediff('day', demo_scheduled_date, close_date)), 0) as avg_days_held_to_close
+  from opp_enriched
+  where demo_held = true
+    and demo_scheduled_date is not null
+    and close_date is not null
+  group by 1,2),
+
+velocity_sales_journey as (
+  select
+    date_trunc('month', close_date)::date as month_start,
+    channel,
+    round(avg(datediff('day',case when channel = 'INBOUND' then form_submission_date
+            else first_sales_activity_date
+            end, close_date)), 0) as avg_days_sales_journey
+  from opp_enriched
+  where close_date is not null
+    and ((channel = 'INBOUND' and form_submission_date is not null)
+    or (channel = 'OUTBOUND' and first_sales_activity_date is not null))
+  group by 1,2),
+
+won_revenue as (
+  select
+    date_trunc('month', close_date)::date as month_start,
+    channel,
+    avg(expected_monthly_revenue) as avg_expected_monthly_revenue_won,
+    sum(predicted_sales_with_owner) as sum_predicted_sales_with_owner_won
+  from opp_enriched
+  where is_closed_won = 1
+    and close_date is not null
+  group by 1,2),
+
+--Costs
+sa as (
+  select
+    month as month_start,
+    sum(inbound_sales_team_spend) as inbound_sales_team_spend,
+    sum(outbound_sales_team_spend) as outbound_sales_team_spend
+  from DEMO_DB.GTM_STAGE.STG_EXPENSES_SALARY_AND_COMMISSIONS
+  group by 1),
+  
+ad as (
+  select
+    month as month_start,
+    sum(advertising_spend) as advertising_spend
+  from DEMO_DB.GTM_STAGE.STG_EXPENSES_ADVERTISING
+  group by 1),
+  
+costs as (
+  select
+    b.month_start,
+    b.channel,
+    case
+      when b.channel = 'INBOUND'
+      then coalesce(ad.advertising_spend, 0) + coalesce(sa.inbound_sales_team_spend, 0)
+      else coalesce(sa.outbound_sales_team_spend, 0)
+      end as total_channel_cost
+  from base b
+  left join sa on sa.month_start = b.month_start
+  left join ad on ad.month_start = b.month_start),
+
+final as (
+  select
+    b.month_start,
+    b.channel,
+    b.leads_created,
+    b.demos_scheduled,
+    b.demos_held,
+    b.closed_won,
+    b.closed_lost,
+
+    --Rates
+    round(iff(b.leads_created = 0, null, b.demos_scheduled::float / b.leads_created), 2) as lead_to_demo_scheduled_rate,
+    round(iff(b.demos_scheduled = 0, null, b.demos_held::float / b.demos_scheduled),2) as demo_scheduled_to_held_rate,
+    round(iff(b.demos_held = 0, null, b.closed_won::float / b.demos_held), 2) as demo_held_to_win_rate,
+    round(iff(b.demos_scheduled = 0, null, b.closed_won::float / b.demos_scheduled), 2) as win_rate,
+
+    --Velocity
+    vffa.avg_days_form_submission_to_first_activity,
+    vfad.avg_days_first_activity_to_demo_scheduled,
+    vhc.avg_days_held_to_close,
+    vsj.avg_days_sales_journey,
+
+    --Costs + CAC
+    round(coalesce(c.total_channel_cost, 0), 0) as total_channel_cost,
+    round(coalesce(c.total_channel_cost, 0) / nullif(b.closed_won, 0), 0) as operational_cac,
+    round(operational_cac/ nullif(wr.avg_expected_monthly_revenue_won * 0.75, 0),2) as payback_months,
+
+
+   --New MMR
+    round((500 * b.closed_won) + coalesce(wr.sum_predicted_sales_with_owner_won, 0), 0) as new_monthly_revenue,
+
+    --ARPA
+    round(coalesce(wr.avg_expected_monthly_revenue_won, 0), 0) as avg_expected_monthly_revenue,
+    round(coalesce(wr.avg_expected_monthly_revenue_won, 0)/30) as avg_expected_daily_revenue,
+
+--ELTV w/ 75% Gross Margin assumed
+    round(coalesce(wr.avg_expected_monthly_revenue_won, 0) * 0.75 * 6, 0)  as eltv_6_months,
+    round(coalesce(wr.avg_expected_monthly_revenue_won, 0) * 0.75 * 12, 0) as eltv_12_months,
+    round(coalesce(wr.avg_expected_monthly_revenue_won, 0) * 0.75 * 24, 0) as eltv_24_months,
+
+--CAC: ELTV
+    round((coalesce(c.total_channel_cost, 0) / nullif(b.closed_won, 0))
+          / nullif(coalesce(wr.avg_expected_monthly_revenue_won, 0) * 0.75 * 6, 0), 2)  as cac_to_eltv_6,
+    round((coalesce(c.total_channel_cost, 0) / nullif(b.closed_won, 0))
+          / nullif(coalesce(wr.avg_expected_monthly_revenue_won, 0) * 0.75 * 12, 0), 2) as cac_to_eltv_12,
+    round((coalesce(c.total_channel_cost, 0) / nullif(b.closed_won, 0))
+          / nullif(coalesce(wr.avg_expected_monthly_revenue_won, 0) * 0.75 * 24, 0), 2) as cac_to_eltv_24
+
+  from base b
+  left join velocity_form_to_first_activity vffa
+    on b.month_start = vffa.month_start and b.channel = vffa.channel
+  left join velocity_first_activity_to_demo vfad
+    on b.month_start = vfad.month_start and b.channel = vfad.channel
+  left join velocity_held_to_close vhc
+    on b.month_start = vhc.month_start and b.channel = vhc.channel
+  left join velocity_sales_journey vsj
+    on b.month_start = vsj.month_start and b.channel = vsj.channel
+  left join won_revenue wr
+    on b.month_start = wr.month_start and b.channel = wr.channel
+  left join costs c
+    on b.month_start = c.month_start and b.channel = c.channel)
+
+select *
+from final
+order by
+  case when channel = 'INBOUND' then 1 else 2 end,
+  channel,
+  month_start;
+
+--QA
+select *
+from DEMO_DB.GTM_MART.VW_GTM_FUNNEL_UNIT_ECONOMICS_MONTHLY;
